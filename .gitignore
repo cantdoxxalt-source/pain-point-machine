@@ -35,6 +35,7 @@ package-lock.json
 *.json
 !package.json
 !tsconfig.json
+!vercel.json
 
 # Logs
 *.log
