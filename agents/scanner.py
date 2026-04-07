@@ -1,30 +1,26 @@
 """
 Reddit Pain Point Scanner Agent
 
-Scans r/hairloss using PRAW, extracts posts and comments,
-scores them by pain intensity, and returns ranked pain points
-for downstream sales agents to act on.
+Scans r/hairloss using Reddit's public JSON feed (NO API key required),
+extracts posts and comments, scores them by pain intensity, and returns
+ranked pain points for downstream agents.
 
 Usage:
-    from agents.scanner import scan
+    from agents.scanner import scan, scan_multi, score_text
     results = scan()                         # defaults: r/hairloss, new, 100 posts
     results = scan(sort="hot", post_limit=50)
     results = scan_multi()                   # sweeps new + hot + top, deduped
 """
 
 import re
+import time
 import logging
+import requests
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from functools import lru_cache
 
-import praw
-from praw.exceptions import RedditAPIException
-
 from agents.config import (
-    REDDIT_CLIENT_ID,
-    REDDIT_CLIENT_SECRET,
-    REDDIT_USER_AGENT,
     DEFAULT_SUBREDDIT,
     SCAN_POST_LIMIT,
     SCAN_COMMENT_DEPTH,
@@ -32,6 +28,10 @@ from agents.config import (
 )
 
 log = logging.getLogger(__name__)
+
+# Reddit public JSON — no auth needed
+REDDIT_BASE = "https://www.reddit.com"
+HEADERS = {"User-Agent": "pain-point-machine/1.0"}
 
 # ---------------------------------------------------------------------------
 # Config
@@ -63,13 +63,51 @@ PAIN_SIGNALS: dict[str, int] = {
     "what worked": 1, "recommendations": 1, "help": 1,
 }
 
-# Pre-compile all patterns once
-@lru_cache(maxsize=1)
+# ---------------------------------------------------------------------------
+# Dynamic keyword loading (merges built-in + custom from DB)
+# ---------------------------------------------------------------------------
+_signal_cache: list[tuple[re.Pattern, str, int]] | None = None
+
+
 def _compiled_signals() -> list[tuple[re.Pattern, str, int]]:
-    return [
+    global _signal_cache
+    if _signal_cache is not None:
+        return _signal_cache
+    return _rebuild_signals()
+
+
+def _rebuild_signals(custom_keywords: list[dict] | None = None) -> list[tuple[re.Pattern, str, int]]:
+    """Rebuild signal patterns from built-in + custom keywords."""
+    global _signal_cache
+    merged = dict(PAIN_SIGNALS)
+
+    if custom_keywords is None:
+        try:
+            from agents.store import Store
+            store = Store()
+            custom_keywords = store.get_custom_keywords()
+        except Exception:
+            custom_keywords = []
+
+    for kw in custom_keywords:
+        keyword = kw.get("keyword", "").strip().lower()
+        tier = kw.get("tier", 2)
+        if keyword:
+            merged[keyword] = tier
+
+    _signal_cache = [
         (re.compile(r'\b' + re.escape(sig) + r'\b', re.IGNORECASE), sig, weight)
-        for sig, weight in PAIN_SIGNALS.items()
+        for sig, weight in merged.items()
     ]
+    log.info("Loaded %d signals (%d built-in + %d custom)",
+             len(_signal_cache), len(PAIN_SIGNALS), len(custom_keywords))
+    return _signal_cache
+
+
+def reload_signals():
+    """Force reload signals (call after adding/removing custom keywords)."""
+    global _signal_cache
+    _signal_cache = None
 
 # Engagement multipliers
 UPVOTE_THRESHOLDS = [(50, 1.5), (20, 1.3), (10, 1.1)]
@@ -82,11 +120,11 @@ COMMENT_THRESHOLDS = [(30, 1.4), (15, 1.2), (5, 1.1)]
 @dataclass
 class PainPoint:
     """A single scored pain point extracted from Reddit."""
-    text: str                     # original text snippet
-    score: float                  # composite pain score
-    source_url: str               # permalink
-    source_title: str             # post title
-    author: str                   # Reddit username
+    text: str
+    score: float
+    source_url: str
+    source_title: str
+    author: str
     matched_signals: list[str] = field(default_factory=list)
     upvotes: int = 0
     comment_count: int = 0
@@ -116,7 +154,6 @@ class PainPoint:
 # Scoring engine
 # ---------------------------------------------------------------------------
 def _engagement_multiplier(upvotes: int, comments: int) -> float:
-    """Boost score based on engagement — high engagement = validated pain."""
     mult = 1.0
     for threshold, boost in UPVOTE_THRESHOLDS:
         if upvotes >= threshold:
@@ -130,7 +167,6 @@ def _engagement_multiplier(upvotes: int, comments: int) -> float:
 
 
 def _recency_multiplier(created_utc: float) -> float:
-    """Recent posts score higher — pain is freshest within 7 days."""
     age_days = (datetime.now(timezone.utc) - datetime.fromtimestamp(created_utc, tz=timezone.utc)).days
     if age_days <= 1:
         return 1.5
@@ -146,11 +182,7 @@ def _recency_multiplier(created_utc: float) -> float:
 
 def score_text(text: str, upvotes: int = 0, comments: int = 0,
                created_utc: float = 0.0) -> tuple[float, list[str]]:
-    """
-    Score a piece of text for pain intensity.
-
-    Returns (score, matched_signals).
-    """
+    """Score a piece of text for pain intensity. Returns (score, matched_signals)."""
     base_score = 0
     matched = []
 
@@ -177,28 +209,78 @@ def score_text(text: str, upvotes: int = 0, comments: int = 0,
 
 
 # ---------------------------------------------------------------------------
-# Reddit scanner
+# Reddit JSON fetcher (NO API KEY NEEDED)
 # ---------------------------------------------------------------------------
-def _build_client() -> praw.Reddit:
-    """Build PRAW client from config (loaded via env vars)."""
-    missing = []
-    if not REDDIT_CLIENT_ID:
-        missing.append("REDDIT_CLIENT_ID")
-    if not REDDIT_CLIENT_SECRET:
-        missing.append("REDDIT_CLIENT_SECRET")
-    if missing:
-        raise EnvironmentError(
-            f"Missing env vars: {', '.join(missing)}. "
-            "Set them in .env or export directly."
-        )
+def _fetch_posts(subreddit: str, sort: str, limit: int,
+                 time_filter: str = "week") -> list[dict]:
+    """Fetch posts from Reddit's public JSON endpoint."""
+    url = f"{REDDIT_BASE}/r/{subreddit}/{sort}.json"
+    params = {"limit": min(limit, 100), "raw_json": 1}
+    if sort == "top":
+        params["t"] = time_filter
 
-    return praw.Reddit(
-        client_id=REDDIT_CLIENT_ID,
-        client_secret=REDDIT_CLIENT_SECRET,
-        user_agent=REDDIT_USER_AGENT,
-    )
+    all_posts = []
+    after = None
+
+    while len(all_posts) < limit:
+        if after:
+            params["after"] = after
+
+        try:
+            resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as e:
+            log.error("Reddit fetch error: %s", e)
+            break
+
+        children = data.get("data", {}).get("children", [])
+        if not children:
+            break
+
+        for child in children:
+            if child.get("kind") == "t3":
+                all_posts.append(child["data"])
+
+        after = data.get("data", {}).get("after")
+        if not after:
+            break
+
+        # Be polite — Reddit rate limits public JSON at ~1 req/sec
+        time.sleep(1.2)
+
+    return all_posts[:limit]
 
 
+def _fetch_comments(permalink: str, limit: int = 5) -> list[dict]:
+    """Fetch top comments for a post via public JSON."""
+    url = f"{REDDIT_BASE}{permalink}.json"
+    params = {"limit": limit, "sort": "top", "raw_json": 1}
+
+    try:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        log.debug("Comment fetch error for %s: %s", permalink, e)
+        return []
+
+    if not isinstance(data, list) or len(data) < 2:
+        return []
+
+    comments = []
+    for child in data[1].get("data", {}).get("children", []):
+        if child.get("kind") == "t1":
+            comments.append(child["data"])
+        if len(comments) >= limit:
+            break
+
+    return comments
+
+
+# ---------------------------------------------------------------------------
+# Scanner
+# ---------------------------------------------------------------------------
 def scan(
     subreddit: str = SUBREDDIT,
     post_limit: int = POST_LIMIT,
@@ -208,74 +290,66 @@ def scan(
 ) -> list[dict]:
     """
     Scan a subreddit and return scored pain points sorted by score descending.
-
-    Args:
-        subreddit: subreddit name (no r/ prefix)
-        post_limit: max posts to fetch
-        sort: "new", "hot", or "top"
-        time_filter: for "top" sort — "hour", "day", "week", "month", "year", "all"
-        min_score: minimum pain score to include
-
-    Returns:
-        List of pain point dicts, highest score first.
+    Uses Reddit's public JSON — no API key required.
     """
-    reddit = _build_client()
-    sub = reddit.subreddit(subreddit)
+    log.info("Fetching r/%s/%s (limit=%d)...", subreddit, sort, post_limit)
+    posts = _fetch_posts(subreddit, sort, post_limit, time_filter)
+    log.info("Fetched %d posts from r/%s (%s)", len(posts), subreddit, sort)
 
-    fetch_kwargs = {"limit": post_limit}
-    if sort == "top":
-        fetch_kwargs["time_filter"] = time_filter
-
-    fetch = {"new": sub.new, "hot": sub.hot, "top": sub.top}
-    try:
-        submissions = list(fetch.get(sort, sub.new)(**fetch_kwargs))
-    except RedditAPIException as e:
-        log.error("Reddit API error during fetch: %s", e)
-        return []
-
-    log.info("Fetched %d posts from r/%s (%s)", len(submissions), subreddit, sort)
     pain_points: list[PainPoint] = []
 
-    for post in submissions:
-        combined_text = f"{post.title} {post.selftext}"
-        post_score, post_signals = score_text(
-            combined_text, post.score, post.num_comments, post.created_utc
-        )
+    for post in posts:
+        title = post.get("title", "")
+        body = post.get("selftext", "")
+        combined_text = f"{title} {body}"
+        upvotes = post.get("ups", 0)
+        num_comments = post.get("num_comments", 0)
+        created = post.get("created_utc", 0)
+        permalink = post.get("permalink", "")
+        author = post.get("author", "[deleted]") or "[deleted]"
+
+        post_score, post_signals = score_text(combined_text, upvotes, num_comments, created)
 
         if post_score >= min_score:
             pain_points.append(PainPoint(
                 text=combined_text.strip(),
                 score=post_score,
-                source_url=post.permalink,
-                source_title=post.title,
-                author=str(post.author) if post.author else "[deleted]",
+                source_url=permalink,
+                source_title=title,
+                author=author,
                 matched_signals=post_signals,
-                upvotes=post.score,
-                comment_count=post.num_comments,
-                created_utc=post.created_utc,
+                upvotes=upvotes,
+                comment_count=num_comments,
+                created_utc=created,
                 is_comment=False,
             ))
 
-        # Score top-level comments
-        post.comment_sort = "top"
-        post.comments.replace_more(limit=0)
-        for comment in post.comments[:COMMENT_DEPTH]:
-            c_score, c_signals = score_text(
-                comment.body, comment.score, 0, comment.created_utc
-            )
-            if c_score >= min_score:
-                pain_points.append(PainPoint(
-                    text=comment.body.strip(),
-                    score=c_score,
-                    source_url=comment.permalink,
-                    source_title=post.title,
-                    author=str(comment.author) if comment.author else "[deleted]",
-                    matched_signals=c_signals,
-                    upvotes=comment.score,
-                    comment_count=0,
-                    created_utc=comment.created_utc,
-                    is_comment=True,
-                ))
+        # Fetch and score top comments
+        if num_comments > 0:
+            comments = _fetch_comments(permalink, COMMENT_DEPTH)
+            time.sleep(0.8)  # rate limit
+
+            for comment in comments:
+                c_body = comment.get("body", "")
+                c_ups = comment.get("ups", 0)
+                c_created = comment.get("created_utc", 0)
+                c_author = comment.get("author", "[deleted]") or "[deleted]"
+                c_permalink = comment.get("permalink", permalink)
+
+                c_score, c_signals = score_text(c_body, c_ups, 0, c_created)
+                if c_score >= min_score:
+                    pain_points.append(PainPoint(
+                        text=c_body.strip(),
+                        score=c_score,
+                        source_url=c_permalink,
+                        source_title=title,
+                        author=c_author,
+                        matched_signals=c_signals,
+                        upvotes=c_ups,
+                        comment_count=0,
+                        created_utc=c_created,
+                        is_comment=True,
+                    ))
 
     return _dedupe_and_sort(pain_points)
 
@@ -287,16 +361,13 @@ def scan_multi(
 ) -> list[dict]:
     """
     Sweep new + hot + top(week) for maximum coverage, deduplicated.
-
-    This is the recommended entry point for downstream agents —
-    it catches both trending pain AND fresh posts.
+    Recommended entry point for downstream agents.
     """
     all_points: list[dict] = []
     for sort, tf in [("new", "week"), ("hot", "week"), ("top", "week")]:
         results = scan(subreddit, post_limit, sort, tf, min_score)
         all_points.extend(results)
 
-    # Dedupe across sorts by source_url
     seen: dict[str, dict] = {}
     for r in all_points:
         url = r["source_url"]
@@ -307,7 +378,6 @@ def scan_multi(
 
 
 def _dedupe_and_sort(pain_points: list[PainPoint]) -> list[dict]:
-    """Deduplicate by author+text hash, keep highest scoring, return sorted dicts."""
     seen: dict[str, PainPoint] = {}
     for pp in pain_points:
         key = f"{pp.author}:{hash(pp.text[:100])}"
@@ -319,7 +389,7 @@ def _dedupe_and_sort(pain_points: list[PainPoint]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# CLI
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import json

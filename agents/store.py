@@ -73,6 +73,20 @@ CREATE TABLE IF NOT EXISTS runs (
     status          TEXT DEFAULT 'running'  -- running | completed | failed
 );
 
+CREATE TABLE IF NOT EXISTS subreddits (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT UNIQUE NOT NULL,
+    enabled         INTEGER DEFAULT 1,
+    added_at        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS custom_keywords (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword         TEXT UNIQUE NOT NULL,
+    tier            INTEGER DEFAULT 2,   -- 1=concern, 2=frustration, 3=desperation
+    added_at        TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_pp_author ON pain_points(author);
 CREATE INDEX IF NOT EXISTS idx_pp_score ON pain_points(score DESC);
 CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status);
@@ -279,6 +293,75 @@ class Store:
                 "SELECT 1 FROM pain_points WHERE source_url=?", (source_url,)
             ).fetchone()
         return row is not None
+
+    # ------------------------------------------------------------------
+    # Subreddits
+    # ------------------------------------------------------------------
+    def add_subreddit(self, name: str) -> bool:
+        name = name.strip().lower().replace("r/", "").replace("/", "")
+        if not name:
+            return False
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT INTO subreddits (name, added_at) VALUES (?, ?)",
+                    (name, _now()),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def remove_subreddit(self, sub_id: int):
+        with self._conn() as conn:
+            conn.execute("DELETE FROM subreddits WHERE id=?", (sub_id,))
+
+    def toggle_subreddit(self, sub_id: int):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE subreddits SET enabled = CASE WHEN enabled=1 THEN 0 ELSE 1 END WHERE id=?",
+                (sub_id,),
+            )
+
+    def get_subreddits(self, enabled_only: bool = False) -> list[dict]:
+        with self._conn() as conn:
+            if enabled_only:
+                rows = conn.execute(
+                    "SELECT * FROM subreddits WHERE enabled=1 ORDER BY name"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM subreddits ORDER BY name"
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Custom keywords
+    # ------------------------------------------------------------------
+    def add_keyword(self, keyword: str, tier: int = 2) -> bool:
+        keyword = keyword.strip().lower()
+        tier = max(1, min(3, tier))
+        if not keyword:
+            return False
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT INTO custom_keywords (keyword, tier, added_at) VALUES (?, ?, ?)",
+                    (keyword, tier, _now()),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def remove_keyword(self, kw_id: int):
+        with self._conn() as conn:
+            conn.execute("DELETE FROM custom_keywords WHERE id=?", (kw_id,))
+
+    def get_custom_keywords(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM custom_keywords ORDER BY tier DESC, keyword"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def _now() -> str:

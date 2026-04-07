@@ -28,19 +28,28 @@ from agents.store import Store
 from agents.orchestrator import (
     run_pipeline,
     run_scan_only,
+    run_scan_all,
     run_qualify_only,
     run_draft_only,
 )
 
 
 def cmd_scan(args):
-    """Scan subreddit and store pain points."""
-    report = run_scan_only(args.subreddit, args.limit)
-    print(f"\nScan complete.")
-    print(f"  Pain points found: {report['pain_points_found']}")
-    print(f"  New (not seen before): {report.get('new_pain_points', 0)}")
-    if report["errors"]:
-        print(f"  Errors: {report['errors']}")
+    """Scan subreddit(s) and store pain points."""
+    if args.all:
+        report = run_scan_all(args.limit)
+        print(f"\nScan complete ({', '.join('r/' + s for s in report['subreddits_scanned'])})")
+        print(f"  Pain points found: {report['total_pain_points']}")
+        print(f"  New (not seen before): {report['total_new']}")
+        if report["errors"]:
+            print(f"  Errors: {report['errors']}")
+    else:
+        report = run_scan_only(args.subreddit, args.limit)
+        print(f"\nScan complete.")
+        print(f"  Pain points found: {report['pain_points_found']}")
+        print(f"  New (not seen before): {report.get('new_pain_points', 0)}")
+        if report["errors"]:
+            print(f"  Errors: {report['errors']}")
 
 
 def cmd_qualify(args):
@@ -157,6 +166,7 @@ def main():
     # scan
     p_scan = sub.add_parser("scan", help="Scan Reddit for pain points")
     p_scan.add_argument("--subreddit", default=DEFAULT_SUBREDDIT)
+    p_scan.add_argument("--all", action="store_true", help="Scan all enabled subreddits from DB")
     p_scan.add_argument("--limit", type=int, default=SCAN_POST_LIMIT)
     p_scan.set_defaults(func=cmd_scan)
 

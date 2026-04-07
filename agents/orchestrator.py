@@ -190,6 +190,37 @@ def run_scan_only(subreddit: str = DEFAULT_SUBREDDIT, post_limit: int = SCAN_POS
     return run_pipeline(subreddit=subreddit, post_limit=post_limit, dry_run=True)
 
 
+def run_scan_all(post_limit: int = SCAN_POST_LIMIT) -> dict:
+    """Scan ALL enabled subreddits from the store."""
+    store = Store()
+    subreddits = store.get_subreddits(enabled_only=True)
+
+    if not subreddits:
+        # Fall back to default
+        subreddits = [{"name": DEFAULT_SUBREDDIT}]
+
+    combined = {
+        "subreddits_scanned": [],
+        "total_pain_points": 0,
+        "total_new": 0,
+        "errors": [],
+    }
+
+    for sub in subreddits:
+        name = sub["name"]
+        log.info("Scanning r/%s...", name)
+        report = run_pipeline(subreddit=name, post_limit=post_limit, dry_run=True, store=store)
+        combined["subreddits_scanned"].append(name)
+        combined["total_pain_points"] += report.get("pain_points_found", 0)
+        combined["total_new"] += report.get("new_pain_points", 0)
+        combined["errors"].extend(report.get("errors", []))
+
+    log.info("Scanned %d subreddits: %d pain points, %d new",
+             len(combined["subreddits_scanned"]),
+             combined["total_pain_points"], combined["total_new"])
+    return combined
+
+
 def run_qualify_only(min_lead_score: float = QUAL_MIN_LEAD_SCORE) -> dict:
     """Qualify all unqualified pain points in the store."""
     return run_pipeline(skip_draft=True, min_lead_score=min_lead_score, post_limit=0)
