@@ -5,10 +5,13 @@ All tunables live here so agents stay in sync.
 """
 
 import os
+from pathlib import Path
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    # Always load .env from project root (parent of agents/)
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    load_dotenv(_env_path, override=True)
 except ImportError:
     pass
 
